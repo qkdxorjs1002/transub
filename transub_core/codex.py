@@ -5,11 +5,12 @@ import collections
 import json
 import os
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+from .runtime import check_cancelled, communicate, run_captured, terminate
 
 
 class CodexError(RuntimeError):
@@ -67,22 +68,22 @@ class CodexRunner:
             fd = os.open(self.home / "auth.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as dest, auth.open("rb") as source:
                 shutil.copyfileobj(source, dest)
-            help_result = subprocess.run([self.executable, "exec", "--help"], env=self.env,
-                                         cwd=self.cwd, capture_output=True, text=True, timeout=30)
+            help_result = run_captured([self.executable, "exec", "--help"], env=self.env,
+                                       cwd=self.cwd, text=True, timeout=30)
             required = ("--ignore-user-config", "--ignore-rules", "--ephemeral", "--output-schema")
             if help_result.returncode or not all(flag in help_result.stdout for flag in required):
                 raise CodexError("현재 Codex CLI에 필수 격리 옵션이 없습니다. Codex CLI를 업데이트하세요.")
-            features = subprocess.run([self.executable, "features", "list"], env=self.env,
-                                      cwd=self.cwd, capture_output=True, text=True, timeout=30)
+            features = run_captured([self.executable, "features", "list"], env=self.env,
+                                    cwd=self.cwd, text=True, timeout=30)
             names = {line.split()[0] for line in features.stdout.splitlines() if line.split()}
             if features.returncode or "skip_host_skill_discovery" not in names:
                 raise CodexError("이 Codex CLI는 호스트 스킬 검색 차단을 지원하지 않습니다.")
             self.disabled = [name for name in DISABLED_FEATURES if name in names]
-            self.version = subprocess.run([self.executable, "--version"], env=self.env,
-                                          cwd=self.cwd, capture_output=True, text=True, timeout=30).stdout.strip()
+            self.version = run_captured([self.executable, "--version"], env=self.env,
+                                        cwd=self.cwd, text=True, timeout=30).stdout.strip()
             # Managed/system settings remain in force. Fail if any MCP server survives isolation.
-            mcp = subprocess.run([self.executable, "mcp", "list", "--json"], env=self.env,
-                                 cwd=self.cwd, capture_output=True, text=True, timeout=30)
+            mcp = run_captured([self.executable, "mcp", "list", "--json"], env=self.env,
+                               cwd=self.cwd, text=True, timeout=30)
             if mcp.returncode or json.loads(mcp.stdout) != []:
                 raise CodexError("격리된 홈에도 MCP 설정이 있습니다. 시스템/관리 설정을 확인하세요.")
             return self
@@ -114,6 +115,7 @@ class CodexRunner:
         return args + ["-"]
 
     def call(self, prompt: str, schema: dict, label: str, research: bool = False) -> dict:
+        check_cancelled()
         with tempfile.TemporaryDirectory(prefix="request-", dir=self.root) as directory:
             folder = Path(directory)
             schema_path, output_path = folder / "schema.json", folder / "result.json"
@@ -126,21 +128,10 @@ class CodexRunner:
                                            text=True, encoding="utf-8", env=self.env, cwd=self.cwd,
                                            start_new_session=os.name != "nt")
                 try:
-                    process.communicate(prompt, timeout=self.timeout)
+                    communicate(process, prompt, timeout=self.timeout)
+                    check_cancelled()
                 except BaseException:
-                    if process.poll() is None:
-                        if os.name != "nt":
-                            os.killpg(process.pid, signal.SIGTERM)
-                        else:
-                            process.terminate()
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            if os.name != "nt":
-                                os.killpg(process.pid, signal.SIGKILL)
-                            else:
-                                process.kill()
-                            process.wait()
+                    terminate(process)
                     raise
                 events.seek(0)
                 types = collections.Counter()

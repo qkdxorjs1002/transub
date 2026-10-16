@@ -5,18 +5,24 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor, wait as wait_for_futures
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from transub import main, parser
 from transub_core.batch import discover_videos, process_input
+from transub_core import runtime
 from transub_core.codex import CodexError, CodexRunner, DISABLED_FEATURES, clean_environment
-from transub_core.media import (MediaError, language, probe, run, select_track, mux, verify_streams, av_hash,
+from transub_core.languages import get_language
+from transub_core.media import (MediaError, language, probe, run, select_track, mux, verify_streams, av_hash, extract,
                                 verify_interleaving, check_packet_delivery)
-from transub_core.pipeline import (ExistingKoreanError, digest, process, translation_prompt, validate_translations,
-                                   translation_schema, assemble_translations)
+from transub_core.pipeline import (ExistingKoreanError, ExistingTargetLanguageError, digest, process,
+                                   translation_prompt, validate_translations, research_prompt, guide_schema,
+                                   job_directory_name, translation_schema, assemble_translations, save_json)
 from transub_core.subtitles import AssDocument, SubtitleError, batches, context_for, protect, restore
 
 
@@ -158,6 +164,48 @@ class SubtitleTests(unittest.TestCase):
                 assemble_translations({"translations": values}, [cue])
 
 
+class TargetPromptTests(unittest.TestCase):
+    def test_korean_prompt_bytes_retain_legacy_checkpoint_keys(self):
+        doc = AssDocument(ASS)
+        chunk = batches(doc.cues, 1)[1]
+        neighbours = context_for(doc.cues, chunk, radius=0)
+        # Captured from the Korean-only implementation before target-language support.
+        research_hash = "846ea02a68729d4d1a38a210bac284d8b86ec8efc2425570866b5f94a259b1c4"
+        translation_hash = "b7b938f42a3294d82d902c4cee4158a16d4ea7c373ba689a578e562f208e1cd5"
+        for target_args in ((), ("ko",), ("kor",)):
+            with self.subTest(target=target_args):
+                research = research_prompt("SOURCE_001.mkv", None, track(0, "eng"), doc, *target_args)
+                translation = translation_prompt({}, chunk, neighbours, {"c000000": "번역_001"}, *target_args)
+                self.assertEqual(hashlib.sha256(research.encode()).hexdigest(), research_hash)
+                self.assertEqual(hashlib.sha256(translation.encode()).hexdigest(), translation_hash)
+
+    def test_research_schema_and_translation_context_follow_target(self):
+        doc = AssDocument(ASS)
+        chunk = batches(doc.cues, 1)[1]
+        neighbours = context_for(doc.cues, chunk, radius=0)
+        for code, name in (("fr", "French"), ("ja", "Japanese")):
+            with self.subTest(target=code):
+                schema = guide_schema(code)["properties"]
+                self.assertEqual(schema["glossary"]["items"]["required"], ["source", "target", "note"])
+                self.assertIn("target_name", schema["characters"]["items"]["required"])
+                self.assertNotIn("korean_name", schema["characters"]["items"]["required"])
+                research = research_prompt("SOURCE_001.mkv", None, track(0, "eng"), doc, code)
+                self.assertIn(f"guide in {name}", research)
+                self.assertNotIn("Korean", research)
+                self.assertEqual(json.loads(research.split("INPUT_DATA:\n")[1])["target_language"], code)
+                prompt = translation_prompt({}, chunk, neighbours, {"c000000": "TARGET_001"}, code)
+                self.assertIn(f"concise {name} subtitles", prompt)
+                self.assertNotIn("previous_korean", prompt)
+                data = json.loads(prompt.split("INPUT_DATA:\n")[1])
+                self.assertEqual(data["target_language"], code)
+                previous = next(c for c in data["context_only"] if c["id"] == "c000000")
+                self.assertEqual(previous["previous_translation"], "TARGET_001")
+                self.assertEqual([c["id"] for c in data["translate"]], [c.id for c in chunk])
+        korean = guide_schema()["properties"]
+        self.assertIn("korean", korean["glossary"]["items"]["required"])
+        self.assertIn("korean_name", korean["characters"]["items"]["required"])
+
+
 class IsolationTests(unittest.TestCase):
     def test_user_selected_default_model(self):
         args = parser().parse_args(["video.mkv"])
@@ -204,6 +252,177 @@ class IsolationTests(unittest.TestCase):
                 self.assertIn(flag, command)
             self.assertIn('web_search="live"' if research else 'web_search="disabled"', command)
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_multiline_progress_keeps_file_prefix_on_each_line(self):
+        output = io.StringIO()
+        with runtime.file_context("SOURCE_001", threading.Event()):
+            runtime.log("STEP_001\nSTEP_002", file=output)
+        self.assertEqual(output.getvalue().splitlines(),
+                         ["SOURCE_001 STEP_001", "SOURCE_001 STEP_002"])
+
+    def test_packet_scan_cancels_on_partial_output_and_reaps_child(self):
+        cancel = threading.Event()
+        partial_seen = threading.Event()
+        children = []
+        popen, read = subprocess.Popen, os.read
+
+        def spawn(*args, **kwargs):
+            command = [sys.executable, "-c",
+                       "import sys, time; sys.stdout.write('packet|stream_index=0'); "
+                       "sys.stdout.flush(); time.sleep(30)"]
+            child = popen(command, **kwargs)
+            children.append(child)
+            return child
+
+        def read_partial(fd, size):
+            chunk = read(fd, size)
+            if children and fd == children[0].stdout.fileno() and chunk:
+                partial_seen.set()
+                cancel.set()
+            return chunk
+
+        def watchdog():
+            cancel.set()
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+
+        timer = threading.Timer(5, watchdog)
+        timer.start()
+        try:
+            with runtime.file_context("SOURCE_001", cancel), \
+                    patch("transub_core.media.subprocess.Popen", side_effect=spawn), \
+                    patch("transub_core.runtime.os.read", side_effect=read_partial), \
+                    self.assertRaises(KeyboardInterrupt):
+                verify_interleaving(Path("SOURCE_001.mkv"),
+                                    {"streams": [{"index": 0, "codec_type": "video"}]}, 1, 1)
+            self.assertTrue(cancel.is_set())
+            self.assertTrue(partial_seen.is_set())
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+        finally:
+            timer.cancel()
+            timer.join()
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+
+    def test_context_restores_log_prefix_and_cancellation_after_error(self):
+        output = io.StringIO()
+        outer, inner = threading.Event(), threading.Event()
+        with runtime.file_context("SOURCE_001", outer):
+            runtime.log("STEP_001", file=output)
+            with self.assertRaises(KeyboardInterrupt):
+                with runtime.file_context("SOURCE_002", inner):
+                    runtime.log("STEP_002", file=output)
+                    inner.set()
+                    runtime.check_cancelled()
+            runtime.check_cancelled()
+            runtime.log("STEP_003", file=output)
+        outer.set()
+        runtime.check_cancelled()
+        runtime.log("STEP_004", file=output)
+        self.assertEqual(output.getvalue().splitlines(),
+                         ["SOURCE_001 STEP_001", "SOURCE_002 STEP_002",
+                          "SOURCE_001 STEP_003", "STEP_004"])
+
+    def test_communicate_retries_without_resending_stdin(self):
+        child = Mock(args=["SOURCE_001"])
+        child.communicate.side_effect = [subprocess.TimeoutExpired(child.args, 0.2),
+                                         ("OUTPUT_001", "")]
+        with runtime.file_context("SOURCE_001", threading.Event()):
+            result = runtime.communicate(child, "INPUT_001", timeout=30)
+        self.assertEqual(result, ("OUTPUT_001", ""))
+        self.assertEqual([call.args for call in child.communicate.call_args_list],
+                         [("INPUT_001",), (None,)])
+        self.assertTrue(all(0 < call.kwargs["timeout"] <= 0.2
+                            for call in child.communicate.call_args_list))
+
+    def test_cancelled_context_prevents_child_start(self):
+        cancel = threading.Event()
+        with runtime.file_context("SOURCE_001", cancel), \
+                patch("transub_core.runtime.subprocess.Popen") as spawn:
+            cancel.set()
+            with self.assertRaises(KeyboardInterrupt):
+                runtime.run_captured([sys.executable, "-c", "pass"], timeout=30)
+        spawn.assert_not_called()
+
+    def test_cancellation_reaps_media_and_codex_children(self):
+        # Real local Python children exercise pipe polling and process cleanup;
+        # no Codex executable, credentials, or network are involved.
+        popen = subprocess.Popen
+        command = [sys.executable, "-c", "import time; time.sleep(30)"]
+        for operation in ("media", "codex"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                cancel = threading.Event()
+                children = []
+                sessions = []
+
+                def spawn(*args, **kwargs):
+                    sessions.append(kwargs.get("start_new_session"))
+                    child = popen(*args, **kwargs)
+                    children.append(child)
+                    communicate = child.communicate
+
+                    def cancel_after_poll(*args, **kwargs):
+                        try:
+                            return communicate(*args, **kwargs)
+                        except subprocess.TimeoutExpired:
+                            cancel.set()
+                            raise
+
+                    child.communicate = cancel_after_poll
+                    return child
+
+                runner = CodexRunner(executable=sys.executable, timeout=30)
+                runner.root = runner.cwd = Path(directory)
+                runner.env = dict(os.environ)
+                try:
+                    with runtime.file_context("SOURCE_001", cancel), \
+                            patch("transub_core.runtime.subprocess.Popen", side_effect=spawn), \
+                            patch.object(runner, "command", return_value=command), \
+                            self.assertRaises(KeyboardInterrupt):
+                        if operation == "media":
+                            run(command, timeout=30)
+                        else:
+                            runner.call("INPUT_001", {}, "REQUEST_001")
+                    self.assertTrue(cancel.is_set())
+                    self.assertEqual(len(children), 1)
+                    self.assertIsNotNone(children[0].poll())
+                    self.assertEqual(sessions, [os.name != "nt"])
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+                finally:
+                    for child in children:
+                        if child.poll() is None:
+                            child.kill()
+                        child.wait()
+
+    def test_timeout_reaps_captured_child(self):
+        children = []
+        popen = subprocess.Popen
+
+        def spawn(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        try:
+            with runtime.file_context("SOURCE_001", threading.Event()), \
+                    patch("transub_core.runtime.subprocess.Popen", side_effect=spawn), \
+                    self.assertRaises(subprocess.TimeoutExpired) as error:
+                runtime.run_captured([sys.executable, "-c", "import time; time.sleep(30)"],
+                                     timeout=0.01, text=True)
+            self.assertEqual(error.exception.timeout, 0.01)
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
 
 
 class InterleaveTests(unittest.TestCase):
@@ -483,15 +702,17 @@ class FakeCodex:
         self.calls.append(label)
         if label == self.fail_at:
             raise CodexError("simulated failure")
+        data = json.loads(prompt.split("INPUT_DATA:\n", 1)[1])
+        target = data.get("target_language", "ko")
         if research:
             return {"work_title": "FIXTURE_TITLE_001", "episode": "1", "identification_confidence": "high",
                     "source_language": "en", "premise": "FIXTURE_PREMISE_001", "glossary": [], "characters": [],
-                    "translation_rules": ["한국어"], "sources": [{"url": "https://example.com/",
+                    "translation_rules": [get_language(target).label], "sources": [{"url": "https://example.com/",
                     "title": "fixture", "supports": "synthetic test"}], "uncertainties": []}
-        data = json.loads(prompt.split("INPUT_DATA:\n", 1)[1])
         result = {}
         for cue in data["translate"]:
-            result[cue["id"]] = {part["id"]: "번역_001" for part in cue["layout"] if "id" in part}
+            result[cue["id"]] = {part["id"]: "번역_001" if target == "ko" else "TARGET_001"
+                                 for part in cue["layout"] if "id" in part}
         return {"translations": result}
 
 
@@ -522,6 +743,9 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(report["in_place"])
         self.assertTrue(report["av_sha256_match"])
         self.assertEqual(report["events"], 4)
+        self.assertEqual(report["target_language"], "ko")
+        self.assertEqual(report["translated_subtitle"], report["korean_subtitle"])
+        self.assertEqual(report["translated_stream_index"], report["korean_stream_index"])
         self.assertEqual([s["tags"].get("language") for s in probe(self.video)["streams"]
                           if s["codec_type"] == "subtitle"], ["eng", "kor"])
         self.assertEqual(list(self.folder.glob("*.mkv")), [self.video])
@@ -534,6 +758,129 @@ class PipelineTests(unittest.TestCase):
             process(self.args)
         self.assertEqual(self.video.read_bytes(), self.original)
         self.assertEqual(list(self.folder.glob(".transub-mux-*")), [])
+
+    def test_cancellation_after_verification_never_publishes_output(self):
+        for separate_output in (False, True):
+            with self.subTest(separate_output=separate_output):
+                cancel = threading.Event()
+                output = self.folder / "TARGET_001.mkv"
+                self.args.output = str(output) if separate_output else None
+
+                def cancel_after_verification(path, data):
+                    save_json(path, data)
+                    if path.name == "verification.json" and data.get("status") == "verified":
+                        cancel.set()
+
+                with runtime.file_context("SOURCE_001", cancel), \
+                        patch("transub_core.pipeline.save_json", side_effect=cancel_after_verification), \
+                        self.assertRaises(KeyboardInterrupt):
+                    process(self.args)
+                self.assertTrue(cancel.is_set())
+                self.assertEqual(self.video.read_bytes(), self.original)
+                self.assertFalse(output.exists())
+                self.assertEqual(list(self.folder.glob(".transub-mux-*")), [])
+
+    def test_non_korean_real_remux_metadata_dispositions_ass_and_av(self):
+        before = probe(self.video)
+        original_hash = av_hash(self.video)
+        source_doc = AssDocument((self.folder / "input.ass").read_text())
+        for code, default_flag in (("fr", "--default-subtitle"), ("ja", "--default-korean")):
+            with self.subTest(target=code):
+                output = self.folder / f"TARGET_001.{code}.mkv"
+                args = parser().parse_args([str(self.video), "--target-language", code,
+                    "--output", str(output), "--work-dir", str(self.folder / f"work-{code}"), default_flag])
+                report = process(args)
+                self.assertEqual(report["target_language"], code)
+                self.assertNotIn("korean_subtitle", report)
+                self.assertNotIn("korean_stream_index", report)
+                self.assertEqual(Path(report["translated_subtitle"]).name, f"translated.{code}.ass")
+                after = probe(output)
+                verification = verify_streams(before, after, target_language=code)
+                self.assertEqual(report["translated_stream_index"], verification["translated_stream_index"])
+                subtitles = [s for s in after["streams"] if s["codec_type"] == "subtitle"]
+                target = subtitles[-1]
+                self.assertEqual(target["tags"]["language"], get_language(code).iso639_2)
+                self.assertEqual(target["tags"]["title"], get_language(code).track_title)
+                self.assertEqual([s["disposition"]["default"] for s in subtitles], [0, 1])
+                self.assertEqual(av_hash(output), original_hash)
+                self.assertTrue(report["av_sha256_match"])
+                self.assertTrue(report["subtitle_delivery_verified"])
+                extracted = self.folder / f"TARGET_001.{code}.ass"
+                extract(output, target, extracted)
+                actual = AssDocument(extracted.read_text(encoding="utf-8-sig"))
+                self.assertEqual(source_doc.verify_structure(actual)["events"], 4)
+                self.assertTrue(all("TARGET_001" in cue.text for cue in actual.cues if cue.translatable))
+                with self.assertRaises(MediaError):
+                    verify_streams(before, after, target_language="de")
+        self.assertEqual(self.video.read_bytes(), self.original)
+
+    def test_target_duplicate_guard_and_both_override_flags(self):
+        self.assertIs(ExistingKoreanError, ExistingTargetLanguageError)
+        self.args.target_language = "fr"
+        process(self.args)
+        translated_bytes = self.video.read_bytes()
+        FakeCodex.calls = []
+        with self.assertRaises(ExistingTargetLanguageError):
+            process(self.args)
+        self.assertEqual(FakeCodex.calls, [])
+        self.assertEqual(self.video.read_bytes(), translated_bytes)
+        for index, flag in enumerate(("--allow-existing-target", "--allow-existing-korean")):
+            with self.subTest(flag=flag):
+                output = self.folder / f"TARGET_00{index + 1}.mkv"
+                args = parser().parse_args([str(self.video), "--target-language", "fra", flag,
+                    "--output", str(output), "--work-dir", str(self.folder / f"override-{index}")])
+                report = process(args)
+                self.assertEqual(report["source_language"], "en")
+                subtitles = [s for s in probe(output)["streams"] if s["codec_type"] == "subtitle"]
+                self.assertEqual([language(s) for s in subtitles], ["en", "fr", "fr"])
+                self.assertEqual(subtitles[-1]["disposition"]["default"], 0)
+
+    def test_default_workdirs_are_target_scoped_and_keep_korean_legacy_path(self):
+        self.args.work_dir = None
+        FakeCodex.fail_at = "research"
+        legacy_name = self.video.stem + "-" + digest(str(self.video.resolve()))[:10]
+        for code in ("ko", "fr", "ja"):
+            with self.subTest(target=code):
+                self.args.target_language = code
+                with patch("transub_core.pipeline.Path.cwd", return_value=self.folder), self.assertRaises(CodexError):
+                    process(self.args)
+                expected_name = legacy_name + ("" if code == "ko" else f"-{code}")
+                manifest = json.loads((self.folder / ".transub" / expected_name / "manifest.json").read_text())
+                self.assertEqual(manifest["target_language"], code)
+        self.assertEqual(len(list((self.folder / ".transub").iterdir())), 3)
+
+    def test_explicit_workdir_rejects_target_switch_before_touching_cache(self):
+        self.args.target_language = "fr"
+        FakeCodex.fail_at = "batch-0002-try-1"
+        with self.assertRaises(CodexError):
+            process(self.args)
+        work = Path(self.args.work_dir)
+        saved = {path: path.read_bytes() for path in work.iterdir() if path.is_file()}
+        self.args.target_language = "ja"
+        with patch("transub_core.pipeline.CodexRunner") as runner:
+            with self.assertRaisesRegex(MediaError, "원본/설정이 다릅니다"):
+                process(self.args)
+        runner.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in work.iterdir() if path.is_file()}, saved)
+        self.assertEqual(self.video.read_bytes(), self.original)
+
+    def test_recursive_non_korean_folder_rerun_skips_without_codex(self):
+        nested = self.folder / "nested" / "SOURCE_002.mkv"
+        nested.parent.mkdir()
+        nested.write_bytes(self.original)
+        args = parser().parse_args([str(self.folder), "--target-language", "fr",
+                                   "--work-dir", str(self.folder / "work")])
+        first = process_input(args)
+        self.assertEqual((first["completed"], first["skipped"], first["failed"]), (2, 0, 0))
+        saved = {path: path.read_bytes() for path in (self.video, nested)}
+        FakeCodex.calls = []
+        second = process_input(args)
+        self.assertEqual((second["completed"], second["skipped"], second["failed"]), (0, 2, 0))
+        self.assertEqual(FakeCodex.calls, [])
+        self.assertEqual({path: path.read_bytes() for path in saved}, saved)
+        for path in saved:
+            work = self.folder / "work" / job_directory_name(path.resolve(), "fr")
+            self.assertEqual(json.loads((work / "manifest.json").read_text())["target_language"], "fr")
 
     def test_resume_only_missing_batches(self):
         FakeCodex.fail_at = "batch-0002-try-1"
@@ -565,14 +912,19 @@ class PipelineTests(unittest.TestCase):
         with patch("transub_core.pipeline.DEFAULT_REASONING", None), self.assertRaises(CodexError):
             process(self.args)
         work = self.folder / "work"
+        manifest_path = work / "manifest.json"
+        legacy_manifest = json.loads(manifest_path.read_text())
+        legacy_manifest.pop("target_language")
+        manifest_path.write_text(json.dumps(legacy_manifest))
         saved = {name: (work / name).read_bytes()
-                 for name in ("manifest.json", "research.json", "batch-0001.json")}
-        self.assertIsNone(json.loads(saved["manifest.json"])["reasoning"])
+                 for name in ("research.json", "batch-0001.json")}
+        self.assertIsNone(legacy_manifest["reasoning"])
         FakeCodex.calls, FakeCodex.fail_at = [], None
         with patch("transub_core.pipeline.CodexRunner", wraps=FakeCodex) as runner:
             process(self.args)
         self.assertIsNone(runner.call_args.args[2])
         self.assertEqual(FakeCodex.calls, ["batch-0002-try-1", "batch-0003-try-1"])
+        self.assertEqual(json.loads(manifest_path.read_text()), {**legacy_manifest, "target_language": "ko"})
         for name, contents in saved.items():
             self.assertEqual((work / name).read_bytes(), contents, name)
 
@@ -835,10 +1187,18 @@ class FolderTests(unittest.TestCase):
                   subprocess.TimeoutExpired("ffprobe", 3)]
         outcomes = [ExistingKoreanError("Korean present"), *errors, {"status": "completed"}]
         paths = [self.video(f"{index:02d}.mkv") for index in range(len(outcomes))]
-        with patch("transub_core.batch.process", side_effect=outcomes) as single:
+        by_path = dict(zip(map(str, paths), outcomes))
+
+        def outcome(item):
+            value = by_path[item.video]
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        with patch("transub_core.batch.process", side_effect=outcome) as single:
             result = process_input(self.args)
         self.assertEqual(single.call_count, len(paths))
-        self.assertEqual([call.args[0].video for call in single.call_args_list], list(map(str, paths)))
+        self.assertCountEqual([call.args[0].video for call in single.call_args_list], list(map(str, paths)))
         self.assertTrue(all(call.args[0].work_dir is None for call in single.call_args_list))
         self.assertEqual({key: result[key] for key in
                           ("status", "folder", "total", "completed", "skipped", "failed")},
@@ -852,6 +1212,7 @@ class FolderTests(unittest.TestCase):
         self.assertEqual(result["results"][-1]["result"], {"status": "completed"})
 
     def test_keyboard_interrupt_stops_before_next_video(self):
+        self.args.jobs = 1
         self.video("a.mkv")
         self.video("b.mkv")
         with patch("transub_core.batch.process", side_effect=KeyboardInterrupt) as single:
@@ -859,8 +1220,158 @@ class FolderTests(unittest.TestCase):
                 process_input(self.args)
         single.assert_called_once()
 
+    def test_default_and_explicit_jobs_overlap_without_exceeding_limit(self):
+        for index in range(6):
+            self.video(f"SOURCE_{index:03d}.mkv")
+        for jobs in (2, 3):
+            with self.subTest(jobs=jobs):
+                if jobs == 2:
+                    self.assertEqual(self.args.jobs, 2)
+                else:
+                    self.args.jobs = jobs
+                barrier = threading.Barrier(jobs, timeout=5)
+                lock = threading.Lock()
+                active = peak = 0
+
+                def single(item):
+                    nonlocal active, peak
+                    with lock:
+                        active += 1
+                        peak = max(peak, active)
+                    try:
+                        barrier.wait()
+                        return {"status": "completed"}
+                    finally:
+                        with lock:
+                            active -= 1
+
+                def bounded_wait(futures, **kwargs):
+                    self.assertLessEqual(len(futures), jobs)
+                    return wait_for_futures(futures, **kwargs)
+
+                with patch("transub_core.batch.process", side_effect=single), \
+                        patch("transub_core.batch.wait", side_effect=bounded_wait):
+                    result = process_input(self.args)
+                self.assertEqual(peak, jobs)
+                self.assertEqual(active, 0)
+                self.assertEqual(result["completed"], 6)
+
+    def test_results_keep_discovery_order_when_workers_finish_in_reverse(self):
+        paths = [self.video(f"SOURCE_{index:03d}.mkv") for index in (1, 2)]
+        release_first = threading.Event()
+        completed = []
+
+        def single(item):
+            if item.video == str(paths[0]):
+                self.assertTrue(release_first.wait(5))
+            completed.append(item.video)
+            return {"source": item.video}
+
+        def release_after_completion(futures, **kwargs):
+            done, pending = wait_for_futures(futures, **kwargs)
+            release_first.set()
+            return done, pending
+
+        with patch("transub_core.batch.process", side_effect=single), \
+                patch("transub_core.batch.wait", side_effect=release_after_completion):
+            result = process_input(self.args)
+        self.assertEqual(completed, list(map(str, reversed(paths))))
+        self.assertEqual([item["video"] for item in result["results"]], list(map(str, paths)))
+        self.assertEqual([item["result"]["source"] for item in result["results"]], list(map(str, paths)))
+
+    def test_jobs_one_runs_in_order_on_calling_thread(self):
+        self.args.jobs = 1
+        paths = [self.video(f"SOURCE_{index:03d}.mkv") for index in range(3)]
+        seen = []
+        calling_thread = threading.get_ident()
+
+        def single(item):
+            self.assertEqual(threading.get_ident(), calling_thread)
+            seen.append(item.video)
+            return {}
+
+        with patch("transub_core.batch.process", side_effect=single), \
+                patch("transub_core.batch.ThreadPoolExecutor") as executor:
+            result = process_input(self.args)
+        executor.assert_not_called()
+        self.assertEqual(seen, list(map(str, paths)))
+        self.assertEqual(result["completed"], 3)
+
+    def test_parallel_logs_keep_file_prefixes_and_do_not_leak_to_caller(self):
+        paths = [self.video(f"SOURCE_{index:03d}.mkv") for index in (1, 2)]
+        output = io.StringIO()
+        barrier = threading.Barrier(2, timeout=5)
+
+        def single(item):
+            for index in range(3):
+                barrier.wait()
+                runtime.log(f"{Path(item.video).stem} STEP_{index:03d}", file=output)
+            return {}
+
+        with patch("transub_core.batch.process", side_effect=single):
+            process_input(self.args)
+        runtime.log("CALLER_001", file=output)
+        expected = [f"[{index}/2] {path.name} {path.stem} STEP_{step:03d}"
+                    for index, path in enumerate(paths, 1) for step in range(3)]
+        self.assertCountEqual(output.getvalue().splitlines(), [*expected, "CALLER_001"])
+
+    def test_interrupt_cancels_running_worker_and_never_submits_more_files(self):
+        paths = [self.video(f"SOURCE_{index:03d}.mkv") for index in range(5)]
+        second_started = threading.Event()
+        second_stopped = threading.Event()
+        cancel_events = []
+        submitted = []
+
+        def context(prefix, cancel):
+            cancel_events.append(cancel)
+            return runtime.file_context(prefix, cancel)
+
+        class RecordingExecutor(ThreadPoolExecutor):
+            def submit(self, function, index, video):
+                submitted.append(video)
+                return super().submit(function, index, video)
+
+        def single(item):
+            if item.video == str(paths[0]):
+                self.assertTrue(second_started.wait(5))
+                raise KeyboardInterrupt
+            second_started.set()
+            try:
+                self.assertTrue(cancel_events[-1].wait(5))
+                runtime.check_cancelled()
+                self.fail("running worker ignored cancellation")
+            finally:
+                second_stopped.set()
+
+        with patch("transub_core.batch.process", side_effect=single), \
+                patch("transub_core.batch.file_context", side_effect=context), \
+                patch("transub_core.batch.ThreadPoolExecutor", RecordingExecutor):
+            with self.assertRaises(KeyboardInterrupt):
+                process_input(self.args)
+        self.assertEqual(submitted, paths[:2])
+        self.assertTrue(second_stopped.is_set())
+        self.assertTrue(all(event is cancel_events[0] for event in cancel_events))
+        self.assertTrue(cancel_events[0].is_set())
+
 
 class FolderCliTests(unittest.TestCase):
+    def test_jobs_defaults_to_two_and_accepts_positive_integer(self):
+        self.assertEqual(parser().parse_args(["SOURCE_001"]).jobs, 2)
+        for jobs in (1, 3, 20):
+            with self.subTest(jobs=jobs):
+                self.assertEqual(parser().parse_args(["SOURCE_001", "--jobs", str(jobs)]).jobs, jobs)
+
+    def test_invalid_jobs_exits_before_processing(self):
+        for jobs in ("0", "-1", "1.5", "invalid"):
+            with self.subTest(jobs=jobs), \
+                    patch("sys.argv", ["transub.py", "SOURCE_001", "--jobs", jobs]), \
+                    patch("sys.stderr", new_callable=io.StringIO), \
+                    patch("transub.process_input") as process_batch:
+                with self.assertRaises(SystemExit) as error:
+                    main()
+                self.assertEqual(error.exception.code, 2)
+                process_batch.assert_not_called()
+
     def test_folder_summary_and_exit_status_for_success_skip_and_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -870,11 +1381,19 @@ class FolderCliTests(unittest.TestCase):
                     ([{}, {}], 0, 2, 0, 0),
                     ([ExistingKoreanError("already translated")] * 2, 0, 0, 2, 0),
                     ([MediaError("bad file"), {}], 1, 1, 0, 1)):
+                by_name = dict(zip(("a.mkv", "b.mkv"), outcomes))
+
+                def outcome(item):
+                    value = by_name[Path(item.video).name]
+                    if isinstance(value, BaseException):
+                        raise value
+                    return value
+
                 with self.subTest(code=code, skipped=skipped), \
                         patch("sys.argv", ["transub.py", directory]), \
                         patch("sys.stdout", new_callable=io.StringIO) as stdout, \
                         patch("sys.stderr", new_callable=io.StringIO) as stderr, \
-                        patch("transub_core.batch.process", side_effect=outcomes):
+                        patch("transub_core.batch.process", side_effect=outcome):
                     self.assertEqual(main(), code)
                 lines = stdout.getvalue().splitlines()
                 self.assertEqual(lines[0], f"처리 완료: 총 2개 · 완료 {completed}개 · "

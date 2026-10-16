@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Add Korean embedded subtitles using an isolated, logged-in Codex CLI."""
+"""Add translated embedded subtitles using an isolated, logged-in Codex CLI."""
 import argparse
 import sys
 from pathlib import Path
 
-from transub_core.batch import PROCESS_ERRORS, process_input
+from transub_core.batch import DEFAULT_JOBS, PROCESS_ERRORS, process_input
 from transub_core.codex import DEFAULT_MODEL, DEFAULT_REASONING
+from transub_core.languages import DEFAULT_TARGET_LANGUAGE, LANGUAGES, get_language
 
 
 def positive(value: str) -> int:
@@ -16,13 +17,18 @@ def positive(value: str) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="내장 자막을 순정 Codex로 한국어 번역하여 원본 MKV에 추가합니다.")
-    p.add_argument("video", help="내장 텍스트 자막이 있는 영상 또는 폴더 (하위 폴더의 MKV도 순차 처리)")
+    p = argparse.ArgumentParser(description="내장 자막을 순정 Codex로 원하는 언어로 번역합니다. 기본 목표 언어는 한국어입니다.",
+                                epilog="목표 언어 코드: " + ", ".join(LANGUAGES))
+    p.add_argument("video", help="내장 텍스트 자막이 있는 영상 또는 폴더 (하위 폴더의 MKV도 병렬 처리)")
     p.add_argument("-o", "--output", help="단일 영상의 별도 MKV 출력 경로 (폴더 입력에는 사용 불가)")
     p.add_argument("--work-dir", help="체크포인트/보고서 디렉터리 (폴더 입력은 파일별 하위 디렉터리 생성)")
+    p.add_argument("--jobs", type=positive, default=DEFAULT_JOBS, metavar="N",
+                   help=f"폴더에서 동시에 처리할 파일 수 (기본 {DEFAULT_JOBS}; 1이면 순차 처리)")
     p.add_argument("--title", help="작품/시즌/회차 힌트. 생략하면 Codex가 파일명과 자막으로 조사")
     p.add_argument("--source-track", type=int, help="ffprobe의 자막 stream index (기본 일본어>영어>기타)")
     p.add_argument("--list-tracks", action="store_true", help="내장 자막 목록만 출력")
+    p.add_argument("--target-language", type=target_language_code, default=DEFAULT_TARGET_LANGUAGE,
+                   metavar="CODE", help="목표 언어의 ISO 코드 (기본 ko; 예: en, ja, zh, es; eng 등 3문자 별칭도 허용)")
     p.add_argument("--model", default=DEFAULT_MODEL, help=f"조사·번역 Codex 모델 (기본: {DEFAULT_MODEL})")
     # Omission lets resumed jobs retain their recorded effort, including legacy None.
     p.add_argument("--reasoning", choices=["low", "medium", "high", "xhigh"], default=None,
@@ -31,14 +37,23 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=positive, default=900, help="Codex 요청별 제한 초 (기본 900)")
     p.add_argument("--retries", type=int, choices=range(0, 6), default=2, help="번역 실패 재시도 횟수 (기본 2)")
     p.add_argument("--auth-home", help="auth.json이 있는 기존 Codex 홈 (설정은 읽지 않음)")
-    p.add_argument("--font", help="한국어 ASS 기본 스타일의 Fontname 교체 (생략 시 원본 유지)")
-    p.add_argument("--font-file", help="결과 MKV에 추가 첨부할 한국어 TTF/OTF/TTC 폰트")
-    p.add_argument("--default-korean", action="store_true", help="한국어 트랙을 기본 자막으로 선택")
-    p.add_argument("--allow-existing-korean", action="store_true", help="한국어 트랙이 있어도 새 트랙 추가")
+    p.add_argument("--font", help="번역 ASS 스타일의 Fontname 교체 (생략 시 원본 유지)")
+    p.add_argument("--font-file", help="결과 MKV에 추가 첨부할 TTF/OTF/TTC 폰트")
+    p.add_argument("--default-subtitle", "--default-korean", dest="default_korean", action="store_true",
+                   help="목표 언어 트랙을 기본 자막으로 선택 (--default-korean은 호환 별칭)")
+    p.add_argument("--allow-existing-target", "--allow-existing-korean", dest="allow_existing_korean", action="store_true",
+                   help="목표 언어 자막이 있어도 새 트랙 추가 (--allow-existing-korean은 호환 별칭)")
     p.add_argument("--codex", default="codex", help="Codex CLI 실행 파일")
     p.add_argument("--ffmpeg", default="ffmpeg")
     p.add_argument("--ffprobe", default="ffprobe")
     return p
+
+
+def target_language_code(value: str) -> str:
+    try:
+        return get_language(value).code
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def print_tracks(video, tracks: list[dict]) -> None:
@@ -48,7 +63,8 @@ def print_tracks(video, tracks: list[dict]) -> None:
     languages = {"ja": "일본어", "en": "영어", "ko": "한국어", "und": "언어 미상"}
     for track in tracks:
         language = track.get("language") or "und"
-        details = [languages.get(language, language), track.get("codec") or "코덱 미상"]
+        label = LANGUAGES[language].label if language in LANGUAGES else language
+        details = [languages.get(language, label), track.get("codec") or "코덱 미상"]
         if track.get("title"):
             details.append(track["title"])
         if track.get("forced"):

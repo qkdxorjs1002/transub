@@ -1,19 +1,23 @@
-"""Sequential folder processing through the existing single-video pipeline."""
+"""Bounded parallel folder processing through the single-video pipeline."""
 from __future__ import annotations
 
 import argparse
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from .codex import CodexError
 from .media import MediaError
-from .pipeline import ExistingKoreanError, digest, process
+from .pipeline import ExistingTargetLanguageError, job_directory_name, process
+from .runtime import file_context, log
 from .subtitles import SubtitleError
 
 PROCESS_ERRORS = (CodexError, MediaError, SubtitleError, OSError, ValueError,
                   subprocess.TimeoutExpired)
+DEFAULT_JOBS = 2
 
 
 def discover_videos(folder: Path) -> list[Path]:
@@ -40,26 +44,62 @@ def process_folder(args, folder: Path) -> dict:
     videos = discover_videos(folder)
     if not videos:
         raise MediaError("폴더와 하위 폴더에 처리할 MKV 파일이 없습니다.")
-    results = []
-    counts = {"completed": 0, "skipped": 0, "failed": 0}
-    for index, video in enumerate(videos, 1):
-        print(f"[{index}/{len(videos)}] {video.relative_to(folder)}", file=sys.stderr, flush=True)
+    jobs = getattr(args, "jobs", DEFAULT_JOBS)
+    if not isinstance(jobs, int) or jobs < 1:
+        raise MediaError("--jobs는 1 이상이어야 합니다.")
+    cancel = threading.Event()
+
+    def process_video(index, video):
+        prefix = f"[{index + 1}/{len(videos)}] {video.relative_to(folder)}"
         item_args = argparse.Namespace(**vars(args))
         item_args.video = str(video)
         if args.work_dir:
             item_args.work_dir = str(Path(args.work_dir).expanduser() /
-                                     (video.stem[:80] + "-" + digest(str(video))[:10]))
-        item = {"video": str(video)}
+                                     job_directory_name(video, getattr(args, "target_language", "ko")))
+        with file_context(prefix, cancel):
+            log("처리 시작", file=sys.stderr)
+            item = {"video": str(video)}
+            try:
+                item.update(status="completed", result=process(item_args))
+            except ExistingTargetLanguageError as exc:
+                item.update(status="skipped", reason=str(exc))
+                log(f"건너뜀: {exc}", file=sys.stderr)
+            except PROCESS_ERRORS as exc:
+                item.update(status="failed", error=str(exc))
+                log(f"실패: {exc}", file=sys.stderr)
+            except BaseException:
+                cancel.set()
+                raise
+            return item
+
+    if jobs == 1 or len(videos) == 1:
+        results = [process_video(index, video) for index, video in enumerate(videos)]
+    else:
+        results = [None] * len(videos)
+        pool = ThreadPoolExecutor(max_workers=min(jobs, len(videos)), thread_name_prefix="transub")
+        pending = {}
+        next_index = 0
         try:
-            item.update(status="completed", result=process(item_args))
-        except ExistingKoreanError as exc:
-            item.update(status="skipped", reason=str(exc))
-            print(f"건너뜀: {video.name}: {exc}", file=sys.stderr, flush=True)
-        except PROCESS_ERRORS as exc:
-            item.update(status="failed", error=str(exc))
-            print(f"실패: {video.name}: {exc}", file=sys.stderr, flush=True)
+            while next_index < len(videos) or pending:
+                while next_index < len(videos) and len(pending) < jobs and not cancel.is_set():
+                    future = pool.submit(process_video, next_index, videos[next_index])
+                    pending[future] = next_index
+                    next_index += 1
+                if not pending:
+                    raise KeyboardInterrupt
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    results[pending.pop(future)] = future.result()
+        except BaseException:
+            cancel.set()
+            for future in pending:
+                future.cancel()
+            raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+    counts = {"completed": 0, "skipped": 0, "failed": 0}
+    for item in results:
         counts[item["status"]] += 1
-        results.append(item)
     return {"status": "failed" if counts["failed"] else "completed",
             "folder": str(folder), "total": len(videos), **counts, "results": results}
 

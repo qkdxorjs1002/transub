@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tempfile
 from pathlib import Path
+
+from .languages import LANGUAGES, get_language, normalize_code
+from .runtime import check_cancelled, communicate, iter_output_lines, run_captured, terminate
 
 TEXT_CODECS = {"ass", "ssa", "subrip", "srt", "webvtt", "mov_text", "text"}
 
@@ -17,8 +21,8 @@ class MediaError(RuntimeError):
 
 def run(command: list[str], timeout: float = 600) -> str:
     try:
-        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+        result = run_captured(command, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise MediaError(f"{command[0]} 실행 실패: {exc}") from exc
     if result.returncode:
@@ -43,22 +47,21 @@ def probe(path: Path, ffprobe: str = "ffprobe") -> dict:
 
 def language(stream: dict) -> str:
     tags = {k.lower(): str(v) for k, v in stream.get("tags", {}).items()}
-    value = tags.get("language", "und").lower().replace("_", "-").split("-")[0]
-    for code, aliases in {"ja": {"ja", "jpn", "jp", "japanese"},
-                          "en": {"en", "eng", "english"},
-                          "ko": {"ko", "kor", "korean"}}.items():
-        if value in aliases:
-            return code
+    value = normalize_code(tags.get("language", "und"))
     if value in ("und", "", "unknown"):
         title = tags.get("title", "").lower()
         for code, pattern in (("ja", r"日本語|japanese|\bjpn\b"),
                               ("en", r"english|\beng\b"), ("ko", r"한국어|korean|\bkor\b")):
             if re.search(pattern, title):
                 return code
+        for item in LANGUAGES.values():
+            if re.search(r"\b" + re.escape(item.name.lower()) + r"\b", title):
+                return item.code
     return value or "und"
 
 
-def select_track(streams: list[dict], explicit: int | None = None) -> dict:
+def select_track(streams: list[dict], explicit: int | None = None, target_language: str = "ko") -> dict:
+    target = get_language(target_language)
     subtitles = [s for s in streams if s.get("codec_type") == "subtitle"]
     if explicit is not None:
         found = [s for s in subtitles if s["index"] == explicit]
@@ -67,7 +70,7 @@ def select_track(streams: list[dict], explicit: int | None = None) -> dict:
         if found[0].get("codec_name") not in TEXT_CODECS:
             raise MediaError("선택한 자막은 이미지 자막입니다. OCR은 지원하지 않습니다.")
         return found[0]
-    candidates = [s for s in subtitles if s.get("codec_name") in TEXT_CODECS and language(s) != "ko"]
+    candidates = [s for s in subtitles if s.get("codec_name") in TEXT_CODECS and language(s) != target.code]
     if not candidates:
         raise MediaError("번역할 텍스트 내장 자막이 없습니다. 이미지 자막(PGS/VobSub)은 OCR이 필요합니다.")
 
@@ -89,8 +92,9 @@ def extract(path: Path, stream: dict, target: Path, ffmpeg: str = "ffmpeg") -> N
 
 def mux(path: Path, subtitle: Path, target: Path, info: dict, ffmpeg: str = "ffmpeg",
         default_korean: bool = False, font_file: Path | None = None,
-        replace_subtitle_index: int | None = None) -> None:
+        replace_subtitle_index: int | None = None, target_language: str = "ko") -> None:
     """Attach static files explicitly; mapping them as streams can delay subtitle delivery."""
+    target_lang = get_language(target_language)
     attachments = [s for s in info["streams"] if s.get("codec_type") == "attachment"]
     if replace_subtitle_index is not None and not any(
             s["index"] == replace_subtitle_index and s["codec_type"] == "subtitle" for s in info["streams"]):
@@ -108,11 +112,11 @@ def mux(path: Path, subtitle: Path, target: Path, info: dict, ffmpeg: str = "ffm
                 if not file.exists() or file.stat().st_size != stream.get("extradata_size"):
                     raise MediaError("기존 첨부파일 추출 크기가 일치하지 않습니다.")
         _mux_with_attachments(path, subtitle, target, info, ffmpeg, default_korean, font_file,
-                              replace_subtitle_index, count, attachments, files)
+                              replace_subtitle_index, count, attachments, files, target_lang)
 
 
 def _mux_with_attachments(path, subtitle, target, info, ffmpeg, default_korean, font_file,
-                          replace_subtitle_index, count, attachments, files):
+                          replace_subtitle_index, count, attachments, files, target_lang):
     command = [ffmpeg, "-nostdin", "-v", "error", "-n", "-copyts", "-i", str(path),
                "-i", str(subtitle), "-map", "0"]
     if attachments:
@@ -121,8 +125,8 @@ def _mux_with_attachments(path, subtitle, target, info, ffmpeg, default_korean, 
         command += ["-map", f"-0:{replace_subtitle_index}"]
     command += ["-map", "1:0", "-map_metadata", "0",
                "-map_chapters", "0", "-c", "copy", "-copy_unknown", "-avoid_negative_ts", "disabled",
-               f"-metadata:s:s:{count}", "language=kor", f"-metadata:s:s:{count}",
-               "title=한국어 (Codex 번역)", f"-disposition:s:{count}", "default" if default_korean else "0"]
+               f"-metadata:s:s:{count}", f"language={target_lang.iso639_2}", f"-metadata:s:s:{count}",
+               f"title={target_lang.track_title}", f"-disposition:s:{count}", "default" if default_korean else "0"]
     if default_korean:
         for i in range(count):
             command += [f"-disposition:s:{i}", "-default"]
@@ -142,28 +146,26 @@ def _mux_with_attachments(path, subtitle, target, info, ffmpeg, default_korean, 
 def verify_interleaving(path: Path, info: dict, subtitle_index: int,
                         expected_packets: int, ffprobe: str = "ffprobe") -> dict:
     """Validate delivery order, not a subtitle-only scan that hides late packets."""
+    check_cancelled()
     av = {s["index"] for s in info["streams"] if s["codec_type"] in ("video", "audio")}
     command = [ffprobe, "-v", "error", "-show_packets", "-show_entries",
                "packet=stream_index,pts_time,dts_time", "-of", "compact", str(path)]
     with tempfile.TemporaryFile(mode="w+") as errors:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True,
-                                   encoding="utf-8", stdin=subprocess.DEVNULL)
+                                   encoding="utf-8", stdin=subprocess.DEVNULL,
+                                   start_new_session=os.name != "nt")
         try:
-            report = check_packet_delivery(process.stdout, av, subtitle_index, expected_packets)
-            if process.wait(timeout=30):
+            report = check_packet_delivery(iter_output_lines(process.stdout), av, subtitle_index, expected_packets)
+            communicate(process, timeout=30)
+            check_cancelled()
+            if process.returncode:
                 errors.seek(0)
                 raise MediaError(f"패킷 순서 검사 실패: {errors.read()[-1000:]}")
             return report
         finally:
+            terminate(process)
             if process.stdout:
                 process.stdout.close()
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
 
 
 def check_packet_delivery(lines, av_indices: set[int], subtitle_index: int, expected_packets: int) -> dict:
@@ -239,7 +241,8 @@ def _hevc_configuration(stream: dict, clear_completeness: bool = False) -> bytes
     return bytes(result) if position == len(data) else None
 
 
-def verify_streams(before: dict, after: dict, extra_font: bool = False) -> dict:
+def verify_streams(before: dict, after: dict, extra_font: bool = False, target_language: str = "ko") -> dict:
+    target_lang = get_language(target_language)
     old = before["streams"]
     new = after["streams"]
     if len(new) != len(old) + 1 + int(extra_font):
@@ -264,12 +267,13 @@ def verify_streams(before: dict, after: dict, extra_font: bool = False) -> dict:
             if kind == "attachment" and left.get("tags", {}) != right.get("tags", {}):
                 raise MediaError("원본 첨부파일 메타데이터가 변경되었습니다.")
     subs = [s for s in new if s["codec_type"] == "subtitle"]
-    if language(subs[-1]) != "ko" or subs[-1].get("codec_name") != "ass":
-        raise MediaError("추가된 한국어 ASS 트랙을 찾지 못했습니다.")
+    if not subs or language(subs[-1]) != target_lang.code or subs[-1].get("codec_name") != "ass":
+        raise MediaError(f"추가된 {target_lang.label} ASS 트랙을 찾지 못했습니다.")
     if len(before.get("chapters", [])) != len(after.get("chapters", [])):
         raise MediaError("챕터 수가 변경되었습니다.")
     return {"original_streams": len(old), "output_streams": len(new),
-            "korean_stream_index": subs[-1]["index"], "stream_copy": True}
+            "korean_stream_index" if target_lang.code == "ko" else "translated_stream_index": subs[-1]["index"],
+            "stream_copy": True}
 
 
 def av_hash(path: Path, ffmpeg: str = "ffmpeg") -> str:
